@@ -1,9 +1,11 @@
 import argparse
+from dotenv import load_dotenv
 import os
 import psycopg2
 import pandas as pd
 
 # === CONFIGURATION ===
+load_dotenv()
 parser = argparse.ArgumentParser()
 parser.add_argument('path', type=str, help='Path of folder containing CSVs to import to Postgres')
 args = parser.parse_args()
