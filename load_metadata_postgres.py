@@ -17,7 +17,6 @@ DB_PARAMS = {
     'user': os.environ['DB_USER'],
     'password': os.environ['DB_PW']
 }
-TABLE_NAME = 'variable_metadata'
 
 # === COLUMNS ===
 METADATA_COLUMNS = [
@@ -26,19 +25,12 @@ METADATA_COLUMNS = [
     'longpop', 'shortage', 'longage', 'unit', 'source', 'method'
 ]
 
-def get_largest_metadata_files(directory, top_n=5):
-    metadata_files = [
-        os.path.join(directory, f) for f in os.listdir(directory)
-        if f.startswith('WID_metadata_') and f.endswith('.csv')
-    ]
-    metadata_files.sort(key=lambda f: os.path.getsize(f), reverse=True)
-    return metadata_files[:top_n]
-
-def create_metadata_table(conn):
+def load_all_metadata_to_global_table(conn, table_name, directory):
     with conn.cursor() as cur:
-        cur.execute(f"DROP TABLE IF EXISTS {TABLE_NAME};")
+        # Drop and recreate the global_metadata table
+        cur.execute(f"DROP TABLE IF EXISTS {table_name}_raw;")
         cur.execute(f"""
-            CREATE TABLE {TABLE_NAME} (
+            CREATE TABLE {table_name}_raw (
                 country TEXT,
                 variable TEXT,
                 age TEXT,
@@ -60,47 +52,81 @@ def create_metadata_table(conn):
         """)
         conn.commit()
 
-def insert_metadata(conn, df):
-    with conn.cursor() as cur:
-        for _, row in df.iterrows():
-            cur.execute(sql.SQL(f"""
-                INSERT INTO {TABLE_NAME} ({','.join(METADATA_COLUMNS)})
-                VALUES ({','.join(['%s'] * len(METADATA_COLUMNS))})
-            """), tuple(row[col] for col in METADATA_COLUMNS))
-        conn.commit()
+    # Process all metadata CSVs
+    for filename in os.listdir(directory):
+        if filename.startswith('WID_metadata_') and filename.endswith('.csv'):
+            filepath = os.path.join(directory, filename)
+            print(f"Importing: {filepath}")
+            df = pd.read_csv(filepath, sep=';', usecols=METADATA_COLUMNS, dtype=str)
+            df.fillna('', inplace=True)
 
-def deduplicate_metadata(conn):
-    with conn.cursor() as cur:
-        dedup_query = f"""
-            DELETE FROM {TABLE_NAME} a
-            USING {TABLE_NAME} b
-            WHERE a.ctid > b.ctid
-              AND a.variable = b.variable
-              AND a.age = b.age
-              AND a.pop = b.pop;
-        """
-        cur.execute(dedup_query)
-        conn.commit()
+            # Insert into Postgres
+            with conn.cursor() as cur:
+                for _, row in df.iterrows():
+                    cur.execute(sql.SQL(f"""
+                        INSERT INTO {table_name}_raw ({','.join(METADATA_COLUMNS)})
+                        VALUES ({','.join(['%s'] * len(METADATA_COLUMNS))})
+                    """), tuple(row[col] for col in METADATA_COLUMNS))
+                conn.commit()
 
+def create_global_data_units(conn, table_name, join_table_name):
+    with conn.cursor() as cur:
+        print("Creating global_data table with units included...")
+        cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+        cur.execute(f"""
+            CREATE TABLE {table_name} AS
+            SELECT
+                d.country,
+                d.variable,
+                d.age,
+                d.pop,
+                m.unit,
+                m.source,
+                m.method
+            FROM
+                global_data d
+            LEFT JOIN
+                {join_table_name} m
+            ON
+                d.country = m.country AND
+                d.variable = m.variable AND
+                d.age = m.age AND
+                d.pop = m.pop;
+        """)
+        conn.commit()
+        print("✅ global_data_units created.")
+
+def create_deduplicated_variable_metadata(conn, table_name, old_table_name):
+    with conn.cursor() as cur:
+        print("Creating deduplicated metadata table...")
+        cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+
+        # All columns except 'unit'
+        nondup_cols = [col for col in METADATA_COLUMNS if col not in ['country', 'countryname', 'unit', 'source', 'method']]
+
+        cur.execute(sql.SQL(f"""
+            CREATE TABLE {table_name} AS
+            SELECT DISTINCT {', '.join(nondup_cols)}
+            FROM {old_table_name};
+        """))
+        conn.commit()
+        print("✅ metadata table created with deduplicated rows.")
+
+        
+        
 def main():
     # Connect to the database
     conn = psycopg2.connect(**DB_PARAMS)
     
-    print("Creating metadata table...")
-    create_metadata_table(conn)
-
-    print("Loading largest metadata files...")
-    top_files = get_largest_metadata_files(args.path)
-    print(f"Top 5 largest metadata files: {top_files}")
-
-    for file in top_files:
-        print(f"Importing {file}...")
-        df = pd.read_csv(file, sep=';', usecols=METADATA_COLUMNS, dtype=str)
-        df.fillna('', inplace=True)  # Replace NaN with empty string
-        insert_metadata(conn, df)
-
-    print("Deduplicating metadata entries...")
-    deduplicate_metadata(conn)
+    tname = "variable_metadata"
+    print("Loading metadata into raw metadata table...")
+    load_all_metadata_to_global_table(conn, tname, args.path)
+    
+    print("Joining metadata with global_data...")
+    create_global_data_units(conn, "wid_global_data", f"{tname}_raw")
+    
+    print("Creating deduplicated variable_metadata table...")
+    create_deduplicated_variable_metadata(conn, tname, f"{tname}_raw")
 
     conn.close()
     print("✅ Done: Data loaded and deduplicated.")
